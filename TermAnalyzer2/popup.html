@@ -1,0 +1,368 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Terms Analyzer</title>
+  <style>
+    body {
+      width: 380px;
+      padding: 15px;
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      color: #333;
+      margin: 0;
+    }
+    
+    .header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 15px;
+      padding-bottom: 10px;
+      border-bottom: 1px solid #eee;
+    }
+    
+    .logo {
+      display: flex;
+      align-items: center;
+    }
+    
+    .logo img {
+      width: 32px;
+      height: 32px;
+      margin-right: 10px;
+    }
+    
+    .logo h1 {
+      font-size: 18px;
+      margin: 0;
+      color: #4285f4;
+    }
+    
+    .auto-mode {
+      display: flex;
+      align-items: center;
+    }
+    
+    .switch {
+      position: relative;
+      display: inline-block;
+      width: 40px;
+      height: 20px;
+      margin-right: 8px;
+    }
+    
+    .switch input {
+      opacity: 0;
+      width: 0;
+      height: 0;
+    }
+    
+    .slider {
+      position: absolute;
+      cursor: pointer;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      background-color: #ccc;
+      transition: .4s;
+      border-radius: 20px;
+    }
+    
+    .slider:before {
+      position: absolute;
+      content: "";
+      height: 16px;
+      width: 16px;
+      left: 2px;
+      bottom: 2px;
+      background-color: white;
+      transition: .4s;
+      border-radius: 50%;
+    }
+    
+    input:checked + .slider {
+      background-color: #4285f4;
+    }
+    
+    input:checked + .slider:before {
+      transform: translateX(20px);
+    }
+    
+    .tabs {
+      display: flex;
+      margin-bottom: 15px;
+    }
+    
+    .tab {
+      padding: 8px 15px;
+      cursor: pointer;
+      border-bottom: 2px solid transparent;
+      font-weight: 500;
+      font-size: 14px;
+    }
+    
+    .tab.active {
+      border-bottom-color: #4285f4;
+      color: #4285f4;
+    }
+    
+    .tab-content {
+      display: none;
+    }
+    
+    .tab-content.active {
+      display: block;
+    }
+    
+    .risk-meter {
+      margin: 20px 0;
+      position: relative;
+      height: 35px;
+      background: linear-gradient(to right, #4CAF50, #FFC107, #F44336);
+      border-radius: 5px;
+    }
+    
+    .risk-indicator {
+      position: absolute;
+      width: 10px;
+      height: 35px;
+      background-color: black;
+      top: 0;
+    }
+    
+    .risk-level {
+      text-align: center;
+      font-weight: bold;
+      margin: 5px 0;
+    }
+    
+    .summary {
+      margin-top: 15px;
+      max-height: 200px;
+      overflow-y: auto;
+    }
+    
+    .risk-item {
+      margin: 10px 0;
+      padding: 10px;
+      border-radius: 5px;
+    }
+    
+    .high-risk {
+      background-color: rgba(244, 67, 54, 0.1);
+      border-left: 4px solid #F44336;
+    }
+    
+    .medium-risk {
+      background-color: rgba(255, 193, 7, 0.1);
+      border-left: 4px solid #FFC107;
+    }
+    
+    .low-risk {
+      background-color: rgba(76, 175, 80, 0.1);
+      border-left: 4px solid #4CAF50;
+    }
+    
+    .analyze-btn {
+      width: 100%;
+      padding: 10px;
+      background-color: #4285f4;
+      color: white;
+      border: none;
+      border-radius: 5px;
+      cursor: pointer;
+      margin-top: 10px;
+      font-weight: bold;
+    }
+    
+    .analyze-btn:hover {
+      background-color: #356AC3;
+    }
+    
+    .analyze-btn:disabled {
+      background-color: #A9A9A9;
+      cursor: not-allowed;
+    }
+    
+    .api-key-container {
+      margin-top: 15px;
+      padding: 15px;
+      background-color: #f5f5f5;
+      border-radius: 5px;
+    }
+    
+    .api-key-input {
+      width: 100%;
+      padding: 8px;
+      margin-top: 5px;
+      margin-bottom: 10px;
+      border: 1px solid #ddd;
+      border-radius: 4px;
+    }
+    
+    .loading {
+      text-align: center;
+      padding: 20px;
+    }
+    
+    .loading-spinner {
+      border: 4px solid #f3f3f3;
+      border-top: 4px solid #3498db;
+      border-radius: 50%;
+      width: 30px;
+      height: 30px;
+      animation: spin 1s linear infinite;
+      margin: 0 auto 15px auto;
+    }
+    
+    @keyframes spin {
+      0% { transform: rotate(0deg); }
+      100% { transform: rotate(360deg); }
+    }
+    
+    .domain-info {
+      font-size: 14px;
+      color: #666;
+      margin-bottom: 10px;
+    }
+    
+    .links-list {
+      margin-top: 10px;
+      max-height: 150px;
+      overflow-y: auto;
+    }
+    
+    .links-list a {
+      display: block;
+      padding: 5px 0;
+      color: #4285f4;
+      text-decoration: none;
+    }
+    
+    .links-list a:hover {
+      text-decoration: underline;
+    }
+    
+    .no-links {
+      color: #666;
+      font-style: italic;
+    }
+    
+    .settings-btn {
+      background: none;
+      border: none;
+      cursor: pointer;
+      color: #666;
+      padding: 5px;
+      font-size: 14px;
+    }
+    
+    .settings-btn:hover {
+      color: #4285f4;
+    }
+    
+    .save-btn {
+      background-color: #4CAF50;
+      color: white;
+      border: none;
+      padding: 8px 15px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-weight: bold;
+    }
+    
+    .save-btn:hover {
+      background-color: #45a049;
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <div class="logo">
+      <img src="icons/icon48.png" alt="Logo">
+      <h1>Terms Analyzer</h1>
+    </div>
+    <div class="auto-mode">
+      <label class="switch">
+        <input type="checkbox" id="autoAnalyzeToggle" checked>
+        <span class="slider"></span>
+      </label>
+      <span>Auto</span>
+    </div>
+  </div>
+
+  <div class="tabs">
+    <div class="tab active" data-tab="analysis">Analysis</div>
+    <div class="tab" data-tab="links">Policy Links</div>
+    <div class="tab" data-tab="settings">Settings</div>
+  </div>
+
+  <div id="domain-info" class="domain-info">Analyzing: ...</div>
+
+  <div id="analysis-tab" class="tab-content active">
+    <div id="loading" class="loading">
+      <div class="loading-spinner"></div>
+      <p>Analyzing policies...</p>
+    </div>
+
+    <div id="analysis-content" style="display: none;">
+      <div class="risk-meter">
+        <div id="risk-indicator" class="risk-indicator" style="left: 0%;"></div>
+      </div>
+      <div id="risk-level" class="risk-level">Risk Level: Analyzing...</div>
+
+      <h3>Summary</h3>
+      <div id="summary" class="summary">
+        <!-- Summary content will be inserted here -->
+      </div>
+
+      <h3>Key Risk Factors</h3>
+      <div id="risk-factors">
+        <!-- Risk factors will be inserted here -->
+      </div>
+
+      <button id="analyze-btn" class="analyze-btn">Re-analyze</button>
+    </div>
+
+    <div id="no-analysis" style="display: none;">
+      <p>No policy analysis available for this site.</p>
+      <p>Click below to manually analyze the current page.</p>
+      <button id="manual-analyze-btn" class="analyze-btn">Analyze This Page</button>
+    </div>
+  </div>
+
+  <div id="links-tab" class="tab-content">
+    <h3>Terms of Service</h3>
+    <div id="terms-links" class="links-list">
+      <p class="no-links">No Terms of Service links detected.</p>
+    </div>
+
+    <h3>Privacy Policy</h3>
+    <div id="privacy-links" class="links-list">
+      <p class="no-links">No Privacy Policy links detected.</p>
+    </div>
+  </div>
+
+  <div id="settings-tab" class="tab-content">
+    <div class="api-key-container">
+      <h3>OpenAI API Key</h3>
+      <p>Enter your OpenAI API key to enable analysis:</p>
+      <input type="password" id="api-key-input" class="api-key-input" placeholder="sk-...">
+      <button id="save-api-key" class="save-btn">Save</button>
+    </div>
+    
+    <div class="api-key-container">
+      <h3>Options</h3>
+      <div>
+        <label class="switch">
+          <input type="checkbox" id="notificationsToggle">
+          <span class="slider"></span>
+        </label>
+        <span>Show notifications for high-risk sites</span>
+      </div>
+    </div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

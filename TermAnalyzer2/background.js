@@ -4,6 +4,7 @@ let activeTabId = null;
 let policyCache = {};
 let analysisCache = {};
 let domainToTabId = {}; // Map domains to tab IDs for cross-reference
+let fetchTimeouts = {}; // Track fetch timeouts to prevent hanging
 
 // Keep track of the active tab
 chrome.tabs.onActivated.addListener((activeInfo) => {
@@ -19,19 +20,42 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     const domain = extractDomain(tab.url);
     domainToTabId[domain] = tabId;
     
-    // Check if we already have analysis for this domain
-    if (analysisCache[tabId] && analysisCache[tabId].domain === domain) {
-      // Analysis exists, update the badge
-      updateBadge(tabId);
-    } else {
-      // No analysis yet, initiate policy discovery
-      chrome.tabs.sendMessage(tabId, { action: "discoverPolicies" }, response => {
-        // Fallback to search if content script doesn't respond or find policies
-        if (!response || !response.success) {
+    // Check if auto-analyze is enabled
+    chrome.storage.local.get(['autoAnalyze'], (result) => {
+      const autoAnalyze = result.autoAnalyze !== undefined ? result.autoAnalyze : true;
+      
+      if (!autoAnalyze) {
+        // If auto-analyze is disabled, just clear the badge
+        chrome.action.setBadgeText({ text: "", tabId });
+        return;
+      }
+      
+      // Check if we already have analysis for this domain
+      if (analysisCache[tabId] && analysisCache[tabId].domain === domain) {
+        // Analysis exists, update the badge
+        updateBadge(tabId);
+      } else {
+        // No analysis yet, initiate policy discovery
+        try {
+          chrome.tabs.sendMessage(tabId, { action: "discoverPolicies" }, response => {
+            // Handle potential error when content script isn't ready
+            if (chrome.runtime.lastError) {
+              console.log("Content script not ready, using direct search instead:", chrome.runtime.lastError);
+              searchPolicyLinks(domain, tabId);
+              return;
+            }
+            
+            // Fallback to search if content script doesn't respond or find policies
+            if (!response || !response.success) {
+              searchPolicyLinks(domain, tabId);
+            }
+          });
+        } catch (error) {
+          console.error("Error sending message to content script:", error);
           searchPolicyLinks(domain, tabId);
         }
-      });
-    }
+      }
+    });
   }
 });
 
@@ -53,6 +77,25 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         !policyCache[tabId].fetchStarted) {
       policyCache[tabId].fetchStarted = true;
       fetchPolicies(tabId, message.links);
+    } else if (message.links.terms.length === 0 && message.links.privacy.length === 0) {
+      // No links found - use fallback analysis
+      const domain = extractDomain(sender.tab.url);
+      
+      // Create a basic fallback analysis
+      const fallbackAnalysis = createFallbackAnalysis(
+        domain, [], [], [], 20 // Default low-medium risk score
+      );
+      
+      // Store fallback analysis
+      analysisCache[tabId] = {
+        ...fallbackAnalysis,
+        domain: domain,
+        timestamp: Date.now(),
+        isFallback: true,
+        message: "No policy documents found on this website."
+      };
+      
+      updateBadge(tabId);
     }
     
     updateBadge(tabId);
@@ -82,6 +125,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     const url = message.url;
     const domain = extractDomain(url);
     
+    // Clear any existing analysis for this tab
+    delete analysisCache[tabId];
+    
+    // Show loading indicator
+    chrome.action.setBadgeText({ text: "...", tabId });
+    chrome.action.setBadgeBackgroundColor({ color: "#FFC107", tabId });
+    
     // Force search for policy links
     searchPolicyLinks(domain, tabId, true);
     sendResponse({ success: true });
@@ -93,7 +143,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 async function searchPolicyLinks(domain, tabId, isManual = false) {
   if (!domain || domain === '') return;
   
-  // Don't search again if we already have analysis for this domain
+  // Don't search again if we already have analysis for this domain and it's not a manual request
   if (!isManual && analysisCache[tabId] && analysisCache[tabId].domain === domain) {
     return;
   }
@@ -111,20 +161,35 @@ async function searchPolicyLinks(domain, tabId, isManual = false) {
     '/terms-of-use',
     '/terms-conditions',
     '/legal',
-    '/tos'
+    '/tos',
+    '/terms.html',
+    '/terms-of-service.html',
+    '/about/legal/terms',
+    '/legal/terms'
   ];
   
   const commonPrivacyPaths = [
     '/privacy',
     '/privacy-policy',
     '/data-policy',
-    '/data-protection'
+    '/data-protection',
+    '/privacy.html',
+    '/privacy-policy.html',
+    '/about/privacy',
+    '/legal/privacy'
   ];
   
   // Construct URLs to check
   const baseURL = `https://${domain}`;
   let termsLinks = commonTermsPaths.map(path => ({ url: baseURL + path, text: 'Terms of Service' }));
   let privacyLinks = commonPrivacyPaths.map(path => ({ url: baseURL + path, text: 'Privacy Policy' }));
+  
+  // Also try www subdomain if domain doesn't already start with www
+  if (!domain.startsWith('www.')) {
+    const wwwBaseURL = `https://www.${domain}`;
+    termsLinks = termsLinks.concat(commonTermsPaths.map(path => ({ url: wwwBaseURL + path, text: 'Terms of Service' })));
+    privacyLinks = privacyLinks.concat(commonPrivacyPaths.map(path => ({ url: wwwBaseURL + path, text: 'Privacy Policy' })));
+  }
   
   // Initialize fetchStarted flag
   policyCache[tabId].fetchStarted = true;
@@ -140,6 +205,33 @@ async function searchPolicyLinks(domain, tabId, isManual = false) {
   // Update badge to indicate fetching
   chrome.action.setBadgeText({ text: "...", tabId });
   chrome.action.setBadgeBackgroundColor({ color: "#FFC107", tabId });
+  
+  // Set a timeout to prevent hanging in the loading state forever
+  if (fetchTimeouts[tabId]) {
+    clearTimeout(fetchTimeouts[tabId]);
+  }
+  
+  fetchTimeouts[tabId] = setTimeout(() => {
+    // Check if we're still in loading state
+    if (policyCache[tabId] && policyCache[tabId].fetchStarted && !analysisCache[tabId]) {
+      console.log("Fetch timeout reached, creating fallback analysis");
+      // Create a fallback analysis
+      const fallbackAnalysis = createFallbackAnalysis(
+        domain, [], [], [], 20 // Default low-medium risk
+      );
+      
+      // Store fallback analysis with timeout message
+      analysisCache[tabId] = {
+        ...fallbackAnalysis,
+        domain: domain,
+        timestamp: Date.now(),
+        isFallback: true,
+        message: "Analysis timed out. The policies may be difficult to locate or process."
+      };
+      
+      updateBadge(tabId);
+    }
+  }, 30000); // 30 second timeout
   
   // Fetch the policies
   fetchPolicies(tabId, links);
@@ -184,8 +276,14 @@ function showRiskNotification(domain, riskScore) {
 function extractDomain(url) {
   try {
     const urlObj = new URL(url);
-    return urlObj.hostname.replace('www.', '');
+    let hostname = urlObj.hostname;
+    
+    // Remove www prefix for consistency
+    hostname = hostname.replace(/^www\./, '');
+    
+    return hostname;
   } catch (e) {
+    console.error("Error extracting domain:", e);
     return url;
   }
 }
@@ -263,8 +361,11 @@ async function fetchPolicies(tabId, links) {
     fetchPromises.push(privacyPromise);
   }
   
-  // Wait for both fetches to complete
-  Promise.all(fetchPromises).then(async results => {
+  // Wait for both fetches to complete or timeout after 20 seconds
+  Promise.race([
+    Promise.all(fetchPromises),
+    new Promise((_, reject) => setTimeout(() => reject(new Error("Fetch timeout")), 20000))
+  ]).then(async results => {
     // Check if we have any content
     const hasContent = results.some(content => content && content.length > 500);
     
@@ -313,8 +414,59 @@ async function fetchPolicies(tabId, links) {
         }
       } catch (error) {
         console.error("Error during analysis:", error);
+        
+        // Create fallback analysis on error
+        const domain = policyCache[tabId].domain;
+        const fallbackAnalysis = createFallbackAnalysis(
+          domain, [], [], [], 30 // Default medium-low risk
+        );
+        
+        // Store fallback analysis with error message
+        analysisCache[tabId] = {
+          ...fallbackAnalysis,
+          domain: domain,
+          timestamp: Date.now(),
+          isFallback: true,
+          message: "Error during analysis. Try again or check settings."
+        };
+        
+        updateBadge(tabId);
       }
+    } else {
+      // No content found - create fallback analysis
+      const domain = policyCache[tabId].domain;
+      const fallbackAnalysis = createFallbackAnalysis(
+        domain, [], [], [], 20 // Default low-medium risk
+      );
+      
+      // Store fallback analysis with no content message
+      analysisCache[tabId] = {
+        ...fallbackAnalysis,
+        domain: domain,
+        timestamp: Date.now(),
+        isFallback: true,
+        message: "No policy content could be retrieved. The site may not have accessible policies."
+      };
+      
+      updateBadge(tabId);
     }
+  }).catch(error => {
+    console.error("Policy fetch failed:", error);
+    
+    // Create fallback analysis on fetch failure
+    const domain = policyCache[tabId].domain;
+    const fallbackAnalysis = createFallbackAnalysis(
+      domain, [], [], [], 35 // Default medium risk (slightly higher because we couldn't analyze)
+    );
+    
+    // Store fallback analysis with fetch error message
+    analysisCache[tabId] = {
+      ...fallbackAnalysis,
+      domain: domain,
+      timestamp: Date.now(),
+      isFallback: true,
+      message: "Could not fetch or process policies. Click 'Policy Links' to try manual discovery."
+    };
     
     updateBadge(tabId);
   });
@@ -348,49 +500,62 @@ async function fetchPolicyContent(url, type) {
     
     xhr.onload = function() {
       if (xhr.status >= 200 && xhr.status < 300) {
-        // Parse HTML
-        const parser = new DOMParser();
-        const doc = parser.parseFromString(xhr.responseText, 'text/html');
-        
-        // Remove script tags and other non-content elements
-        const scripts = doc.querySelectorAll('script, style, noscript, iframe, img');
-        scripts.forEach(script => script.remove());
-        
-        // Extract text
-        let text = "";
-        
-        // Try to find the main content first
-        const mainSelectors = [
-          'main', 'article', '#content', '.content', 
-          '#main-content', '.main-content', '.container'
-        ];
-        
-        // Add specific selectors based on the policy type
-        if (type === 'terms') {
-          mainSelectors.push('#terms', '.terms', '#terms-of-service', '.terms-of-service', 
-                             '#terms-conditions', '.terms-conditions', '#legal', '.legal');
-        } else if (type === 'privacy') {
-          mainSelectors.push('#privacy', '.privacy', '#privacy-policy', '.privacy-policy', 
-                             '#data-policy', '.data-policy');
-        }
-        
-        // Try to find content in the main content areas
-        for (const selector of mainSelectors) {
-          const mainContent = doc.querySelector(selector);
-          if (mainContent) {
-            text = mainContent.textContent.trim();
-            if (text.length > 500) {
-              break;
+        try {
+          // Parse HTML
+          const parser = new DOMParser();
+          const doc = parser.parseFromString(xhr.responseText, 'text/html');
+          
+          // Remove script tags and other non-content elements
+          const scripts = doc.querySelectorAll('script, style, noscript, iframe, img, svg, header, footer, nav');
+          scripts.forEach(script => script.remove());
+          
+          // Extract text
+          let text = "";
+          
+          // Try to find the main content first
+          const mainSelectors = [
+            'main', 'article', '#content', '.content', 
+            '#main-content', '.main-content', '.container',
+            '.main', '.body', '#body', 'body > div:nth-child(1)', 
+            '.page', '#page', '.page-content'
+          ];
+          
+          // Add specific selectors based on the policy type
+          if (type === 'terms') {
+            mainSelectors.push('#terms', '.terms', '#terms-of-service', '.terms-of-service', 
+                               '#terms-conditions', '.terms-conditions', '#legal', '.legal',
+                               '[id*="terms"]', '[class*="terms"]', '[id*="tos"]', '[class*="tos"]');
+          } else if (type === 'privacy') {
+            mainSelectors.push('#privacy', '.privacy', '#privacy-policy', '.privacy-policy', 
+                               '#data-policy', '.data-policy', '[id*="privacy"]', '[class*="privacy"]');
+          }
+          
+          // Try to find content in the main content areas
+          for (const selector of mainSelectors) {
+            try {
+              const mainContent = doc.querySelector(selector);
+              if (mainContent) {
+                text = mainContent.textContent.trim();
+                if (text.length > 500) {
+                  break;
+                }
+              }
+            } catch (err) {
+              console.log(`Error with selector ${selector}:`, err);
             }
           }
+          
+          // If no specific content found, get the body text
+          if (!text || text.length < 500) {
+            text = doc.body.textContent.trim();
+          }
+          
+          resolve(text);
+        } catch (parseError) {
+          console.error("Error parsing HTML content:", parseError);
+          // As a fallback, just return the raw text content
+          resolve(xhr.responseText);
         }
-        
-        // If no specific content found, get the body text
-        if (!text || text.length < 500) {
-          text = doc.body.textContent.trim();
-        }
-        
-        resolve(text);
       } else {
         reject(new Error(`Failed to fetch policy: ${xhr.status}`));
       }
@@ -418,20 +583,23 @@ function performBasicAnalysis(text) {
       "perpetual license", "worldwide license", "irrevocable license", "sell personal information",
       "share with partners", "waive rights", "binding arbitration", "no refunds",
       "no liability", "exclusive jurisdiction", "limitation of liability", "right to monitor",
-      "retain indefinitely", "store your content"
+      "retain indefinitely", "store your content", "transfer your data", "facial recognition",
+      "sell to third parties", "share with advertisers", "biometric data", "waive right to sue"
     ],
     mediumRisk: [
       "collect location data", "track your activity", "personalized advertising",
       "share aggregated data", "retain data indefinitely", "automatically renew",
       "cookies and tracking", "third-party analytics", "behavioral tracking",
       "targeted advertising", "marketing emails", "data retention",
-      "monitor usage", "track behavior", "cross-device tracking", "interest-based ads"
+      "monitor usage", "track behavior", "cross-device tracking", "interest-based ads",
+      "can't opt out", "cannot opt out", "may share", "may collect", "may use"
     ],
     lowRisk: [
       "necessary cookies", "essential account information", "standard analytics",
       "communicate updates", "security measures", "data portability",
       "opt-out options", "delete account", "access your data", "data protection",
-      "right to delete", "right to access", "right to object", "data subject rights"
+      "right to delete", "right to access", "right to object", "data subject rights",
+      "can opt out", "may opt out", "gdpr compliant", "ccpa compliant"
     ]
   };
   
@@ -590,7 +758,8 @@ Format your response as JSON:
       ...fallbackAnalysis,
       domain: domain,
       timestamp: Date.now(),
-      isFallback: true
+      isFallback: true,
+      message: "OpenAI API analysis failed. Using basic analysis instead."
     };
     
     updateBadge(tabId);
@@ -612,6 +781,12 @@ function createFallbackAnalysis(domain, highRiskMatches, mediumRiskMatches, lowR
   
   if (lowRiskMatches.length > 0) {
     summaryPoints.push(`Includes ${lowRiskMatches.length} standard or low-risk terms common in most services.`);
+  }
+  
+  // If we don't have any matches, add generic points
+  if (summaryPoints.length === 0) {
+    summaryPoints.push(`${domain} may have terms and policies that warrant review.`);
+    summaryPoints.push(`Basic analysis could not identify specific risk patterns.`);
   }
   
   // Add general advice
@@ -645,47 +820,100 @@ function createFallbackAnalysis(domain, highRiskMatches, mediumRiskMatches, lowR
   
   // Ensure we have at least 3 factors
   if (fallbackAnalysis.riskFactors.length < 3) {
-    if (lowRiskMatches.length > 0) {
-      fallbackAnalysis.riskFactors.push({
-        title: `Contains "${lowRiskMatches[0]}"`,
-        description: "This is a standard term found in most services.",
-        level: "low"
-      });
-    } else {
-      fallbackAnalysis.riskFactors.push({
-        title: "Limited information available",
-        description: "Unable to find specific risk factors in the extracted content.",
+    // Add generic risk factors if we don't have enough specific ones
+    const genericFactors = [
+      {
+        title: "Limited Analysis Available",
+        description: "Could not perform full analysis of terms, which may hide potentially concerning clauses.",
         level: "medium"
-      });
+      },
+      {
+        title: "Data Collection",
+        description: "Most websites collect some form of user data, which poses inherent privacy risks.",
+        level: "medium"
+      },
+      {
+        title: "Third-Party Sharing",
+        description: "Many services share data with third parties for various purposes including analytics and advertising.",
+        level: "medium"
+      }
+    ];
+    
+    // Add generic factors until we have at least 3
+    for (let i = 0; i < genericFactors.length && fallbackAnalysis.riskFactors.length < 3; i++) {
+      fallbackAnalysis.riskFactors.push(genericFactors[i]);
     }
   }
   
   return fallbackAnalysis;
 }
 
-// Clean up resources for closed tabs
-chrome.tabs.onRemoved.addListener(tabId => {
-  // Clean up cache for closed tabs
-  delete policyCache[tabId];
-  delete analysisCache[tabId];
+// Clean up old cache entries periodically
+setInterval(() => {
+  const now = Date.now();
+  const maxAge = 24 * 60 * 60 * 1000; // 24 hours
   
-  // Clean up domain to tab mappings
-  for (const domain in domainToTabId) {
-    if (domainToTabId[domain] === tabId) {
-      delete domainToTabId[domain];
+  // Clean analysis cache
+  Object.keys(analysisCache).forEach(tabId => {
+    if (analysisCache[tabId].timestamp && (now - analysisCache[tabId].timestamp) > maxAge) {
+      delete analysisCache[tabId];
+    }
+  });
+  
+  // Clean policy cache
+  Object.keys(policyCache).forEach(tabId => {
+    if (policyCache[tabId].timestamp && (now - policyCache[tabId].timestamp) > maxAge) {
+      delete policyCache[tabId];
+    }
+  });
+}, 3600000); // Check every hour
+
+// Listen for settings changes
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === 'local') {
+    // Handle API key changes
+    if (changes.openaiApiKey) {
+      console.log("API key changed, clearing analysis cache");
+      analysisCache = {};
+    }
+    
+    // Handle auto-analyze changes
+    if (changes.autoAnalyze) {
+      if (changes.autoAnalyze.newValue) {
+        console.log("Auto-analyze enabled, starting analysis for active tab");
+        if (activeTabId) {
+          chrome.tabs.get(activeTabId, (tab) => {
+            if (tab && tab.url && tab.url.startsWith('http')) {
+              const domain = extractDomain(tab.url);
+              searchPolicyLinks(domain, activeTabId);
+            }
+          });
+        }
+      } else {
+        console.log("Auto-analyze disabled, clearing badges");
+        // Clear badges on all tabs
+        chrome.tabs.query({}, (tabs) => {
+          tabs.forEach(tab => {
+            chrome.action.setBadgeText({ text: "", tabId: tab.id });
+          });
+        });
+      }
     }
   }
 });
 
-// Initialize settings if not already set
+// Initialize extension
 chrome.runtime.onInstalled.addListener(() => {
-  chrome.storage.local.get(['showNotifications', 'autoAnalyze'], result => {
-    if (result.showNotifications === undefined) {
-      chrome.storage.local.set({ showNotifications: true });
-    }
-    
+  // Set default settings if not already set
+  chrome.storage.local.get(['autoAnalyze', 'showNotifications'], (result) => {
     if (result.autoAnalyze === undefined) {
       chrome.storage.local.set({ autoAnalyze: true });
     }
+    
+    if (result.showNotifications === undefined) {
+      chrome.storage.local.set({ showNotifications: true });
+    }
   });
+  
+  console.log("Policy Analyzer extension installed");
 });

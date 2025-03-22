@@ -21,6 +21,9 @@
     privacy: []
   };
   
+  // Flag to prevent duplicate messages
+  let isRespondingToMessage = false;
+  
   // Listen for requests from popup
   chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     if (request.action === "extractTerms") {
@@ -43,8 +46,9 @@
         title: document.title || "Unknown Page"
       });
     } else if (request.action === "findPolicyLinks") {
-      // Auto detection mode
+      isRespondingToMessage = true;
       detectPolicyLinks();
+      isRespondingToMessage = false;
       sendResponse({
         links: discoveredLinks,
         url: window.location.href,
@@ -56,6 +60,12 @@
         title: document.title || "Unknown Page",
         domain: extractDomain(window.location.href)
       });
+    }
+    else if (request.action === "discoverPolicies") {
+      isRespondingToMessage = true;
+      detectPolicyLinks();
+      isRespondingToMessage = false;
+      sendResponse({ success: true });
     }
     return true;  // Required for async response
   });
@@ -129,11 +139,19 @@
     discoveredLinks.privacy = [...new Map(discoveredLinks.privacy.map(item => 
       [item.url, item])).values()];
       
-    // Send discovered links to background script
-    chrome.runtime.sendMessage({
-      action: "policyLinksFound",
-      links: discoveredLinks
-    });
+    // Send discovered links to background script only if not already responding to a message
+    if (!isRespondingToMessage) {
+      chrome.runtime.sendMessage({
+        action: "policyLinksFound",
+        links: discoveredLinks,
+        success: true
+      });
+    }
+    
+    // If links were found, consider analyzing them
+    if (discoveredLinks.terms.length > 0 && discoveredLinks.terms[0].url) {
+      sendContentForAnalysis("Terms link found: " + discoveredLinks.terms[0].url);
+    }
   }
   
   // Enhanced extraction function that tries multiple strategies
@@ -166,8 +184,31 @@
       return headingContent;
     }
   
-    // Last resort - try to get any significant text blocks
-    return findLargestTextBlocks();
+    // Try to get any significant text blocks
+    const largestBlocks = findLargestTextBlocks();
+    if (largestBlocks && largestBlocks.length > 500) {
+      return largestBlocks;
+    }
+
+    // If still nothing found, try paragraphs specifically
+    const paragraphs = document.querySelectorAll('p');
+    if (paragraphs.length > 5) {
+      const paragraphText = Array.from(paragraphs)
+        .map(p => p.textContent.trim())
+        .join('\n\n');
+      
+      if (paragraphText.length > 500) {
+        return paragraphText;
+      }
+    }
+    
+    // Last resort - body text
+    const bodyText = document.body.textContent.trim();
+    if (bodyText.length > 500) {
+      return bodyText;
+    }
+
+    return "";
   }
   
   // Find content after headings related to terms/privacy
@@ -262,4 +303,17 @@
       detectPolicyLinks();
     }, 1000);
   });
+
+  // Helper function to request content analysis
+  function sendContentForAnalysis(content) {
+    chrome.runtime.sendMessage({
+      action: "analyzeContent",
+      content: content,
+      url: window.location.href,
+      tabId: -1 // background will get actual tabId from sender
+    });
+  }
+  
+  // Immediate execution to ensure script is ready
+  setTimeout(detectPolicyLinks, 500);
 })();
